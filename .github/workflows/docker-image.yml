@@ -28,7 +28,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: q7gs/py_discord_vsb_gameoperator
+          images: q7gs/py_discord_vsb_cs2_gameoperator
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=branch
