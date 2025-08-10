@@ -55,12 +55,10 @@ async def status(server: str):
 # ----- Discord bot
 class CS2Bot(commands.Bot):
     def __init__(self):
+        # Slash-only, no privileged intents required
         intents = discord.Intents.none()
-        intents.guilds = True
-        intents.members = True
-        intents.messages = True
-        intents.message_content = False
-        super().__init__(command_prefix=commands.when_mentioned_or("!"), intents=intents)
+        intents.guilds = True  # needed for slash commands & guild events
+        super().__init__(command_prefix=None, intents=intents)
         self.presence_tasks = None
 
     async def setup_hook(self) -> None:
