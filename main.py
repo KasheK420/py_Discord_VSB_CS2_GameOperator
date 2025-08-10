@@ -65,7 +65,7 @@ class CS2Bot(commands.Bot):
 
     async def setup_hook(self) -> None:
         await self.add_cog(CS2Cog(self))
-        await self.add_cog(PortalCog(self))
+        await self.add_cog(PortaCog(self))
         # sync commands to guild if provided (faster than global)
         if settings.DISCORD_GUILD_ID:
             guild = discord.Object(id=settings.DISCORD_GUILD_ID)
