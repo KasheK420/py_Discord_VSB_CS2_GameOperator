@@ -8,7 +8,7 @@ asyncpg==0.29.0
 alembic==1.13.2    # optional, not used by default
 
 python-a2s==1.4.1         # Steam A2S (UDP) query
-rcon==2.4.7        # Source RCON client
+rcon==2.4.9        # Source RCON client
 
 python-dotenv==1.0.1
 paramiko==3.2.0    # SFTP client
