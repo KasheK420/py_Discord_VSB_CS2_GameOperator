@@ -53,18 +53,29 @@ async def status(server: str):
     }
 
 # ----- Discord bot
+# in main.py
+
 class CS2Bot(commands.Bot):
     def __init__(self):
-        # Slash-only, no privileged intents required
         intents = discord.Intents.none()
-        intents.guilds = True  # needed for slash commands & guild events
+        intents.guilds = True
         super().__init__(command_prefix=None, intents=intents)
         self.presence_tasks = None
 
     async def setup_hook(self) -> None:
-        await self.add_cog(CS2Cog(self))
-        await self.add_cog(PortaCog(self))
-        # sync commands to guild if provided (faster than global)
+        cs2 = CS2Cog(self)
+        porta = PortaCog(self)
+
+        await self.add_cog(cs2)
+        await self.add_cog(porta)
+
+        # Explicitly add the cog's app command to the tree
+        # (prevents situations where it doesn't auto-register)
+        try:
+            self.tree.add_command(porta.cs2panel_porta)  # <- key line
+        except Exception:
+            pass  # harmless if already present
+
         if settings.DISCORD_GUILD_ID:
             guild = discord.Object(id=settings.DISCORD_GUILD_ID)
             await self.tree.sync(guild=guild)
@@ -72,7 +83,9 @@ class CS2Bot(commands.Bot):
         else:
             await self.tree.sync()
             log.info("Slash commands synced globally")
+
         self.presence_tasks = PresenceTasks(self)
+
 
 bot = CS2Bot()
 
