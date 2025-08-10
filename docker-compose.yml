@@ -4,8 +4,6 @@ services:
     build: .
     container_name: cs2-discord-bot
     env_file: .env
-    depends_on:
-      - db
     ports:
       - "${HTTP_PORT:-8080}:8080"
     restart: unless-stopped
