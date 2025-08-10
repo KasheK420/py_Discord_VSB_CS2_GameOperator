@@ -1,310 +1,279 @@
-# services/portal_cog.py
-from __future__ import annotations
 import asyncio
-import contextlib
-import logging
-from typing import Optional
-
 import discord
+from discord.ext import commands, tasks
 from discord import app_commands
-from discord.ext import commands
-
 from utils.config import settings
-from utils.rcon_client import get_status, mc_cmd
-from utils.sftp_client import read_server_properties_text, list_plugins
+from utils.source_query import get_info, get_players
+from utils.rcon_cs2 import rcon_exec
+from utils.db import SessionLocal
+from models import CS2PanelMessage
 
-log = logging.getLogger(__name__)
+SERVER_KEYS = ("surf", "bhop")
 
-# ---- static server manual ----
-ICON_URL = "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcStUAvKkP38bvaD2f4clomJAyu2detk5pfk5A&s"
-SRV_NAME = "VSB - Minecraft Classic"
-SRV_DNS  = "mc.vsb-discord.cz"
-SRV_IP   = "167.235.90.82"
-SRV_PORT = 31095
+def _srv(key: str) -> dict:
+    return settings.CS2[key]
 
-def _csv_ids(val: str) -> list[int]:
-    return [int(x.strip()) for x in str(val or "").split(",") if x.strip().isdigit()]
-
-PORTAL_CHANNEL_ID = int(getattr(settings, "PORTAL_CHANNEL_ID", 1404017766922715226))
-WHITELIST_ALLOWED_ROLE_IDS = _csv_ids(getattr(settings, "DISCORD_WHITELIST_ALLOWED_ROLE_IDS", ""))
-ADMIN_ROLE_IDS = _csv_ids(getattr(settings, "DISCORD_ADMIN_ROLE_IDS", "")) + _csv_ids(getattr(settings, "DISCORD_MOD_ROLE_IDS", ""))
-
-# Auto-refresh & voice status channel
-PORTAL_REFRESH_SECONDS = int(getattr(settings, "PORTAL_REFRESH_SECONDS", 60))
-MC_STATUS_VOICE_CHANNEL_ID = int(getattr(settings, "MC_STATUS_VOICE_CHANNEL_ID", "0") or 0)
-
-def _admin_mentions() -> str:
-    return " ".join(f"<@&{rid}>" for rid in ADMIN_ROLE_IDS) or "@here"
-
-def _has_any_role(member: discord.Member | discord.abc.User, role_ids: list[int]) -> bool:
-    if not role_ids:
-        return True
-    if not isinstance(member, discord.Member):
-        return False
-    uroles = {r.id for r in member.roles}
-    return any(rid in uroles for rid in role_ids)
-
-async def _ack(inter: discord.Interaction, ephemeral: bool = True):
-    if not inter.response.is_done():
-        await inter.response.defer(ephemeral=ephemeral, thinking=True)
-
-def _portal_embed(server_info: Optional[dict] = None, props_small: Optional[dict] = None) -> discord.Embed:
-    e = discord.Embed(
-        title="🎮 Minecraft Server",
-        description="Use the buttons below.",
-        color=0x5865F2,
+def _is_mod(user: discord.abc.User) -> bool:
+    role_ids = {r.id for r in getattr(user, "roles", [])}
+    allowed = (
+        set(settings.roles_from_csv(settings.DISCORD_ADMIN_ROLE_IDS)) |
+        set(settings.roles_from_csv(settings.DISCORD_MOD_ROLE_IDS))
     )
-    e.set_thumbnail(url=ICON_URL)
+    return bool(role_ids & allowed)
 
-    # Manual connection info
-    conn_lines = [
-        f"**Name:** {SRV_NAME}",
-        f"**DNS:** `{SRV_DNS}`",
-        f"**IP:** `{SRV_IP}`",
-        f"**Port:** `{SRV_PORT}`",
-        f"**Quick:** `{SRV_DNS}:{SRV_PORT}`",
-    ]
-    e.add_field(name="Connection", value="\n".join(conn_lines), inline=False)
+# ---------- helpers
 
-    if server_info:
-        online = server_info.get("online", "?")
-        maxp   = server_info.get("max", "?")
-        players_list = server_info.get("players") or []
-        players = ", ".join(players_list) if players_list else "—"
-        e.add_field(name="Online", value=f"{online}/{maxp}", inline=True)
-        e.add_field(name="Players", value=players, inline=True)
-        if "error" in server_info:
-            e.add_field(name="Status Error", value=f"`{server_info['error']}`", inline=False)
-
-    if props_small:
-        pretty = "\n".join(f"**{k}**: {v}" for k, v in props_small.items())
-        if pretty:
-            e.add_field(name="Properties (key fields)", value=pretty, inline=False)
-
-    e.set_footer(text="GameOperator Portal")
+async def build_status_embed() -> discord.Embed:
+    e = discord.Embed(
+        title="CS2 Servers — Surf & Bhop",
+        description="Live status. Use buttons below for actions.",
+        color=discord.Color.blurple()
+    )
+    for key in SERVER_KEYS:
+        s = _srv(key)
+        name = key.upper()
+        try:
+            info = await get_info(s["host"], s["port"])
+            players = await get_players(s["host"], s["port"])
+            names = ", ".join(sorted([p.name for p in players])) or "—"
+            value = (
+                f"**Address:** `{s['host']}:{s['port']}`\n"
+                f"**Map:** `{getattr(info, 'map_name', '?')}`\n"
+                f"**Players:** `{getattr(info, 'player_count', 0)}/{getattr(info, 'max_players', 0)}`\n"
+                f"**Names:** {names[:512]}"
+            )
+            e.add_field(name=f"{name} — ONLINE", value=value, inline=False)
+        except Exception as ex:
+            e.add_field(
+                name=f"{name} — OFFLINE",
+                value=f"**Address:** `{s['host']}:{s['port']}`\nCannot query A2S: `{ex}`",
+                inline=False
+            )
     return e
 
-# ------------------------------ Modals ------------------------------
+async def _ephemeral_info(interaction: discord.Interaction, key: str):
+    s = _srv(key)
+    try:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        info = await get_info(s["host"], s["port"])
+        players = await get_players(s["host"], s["port"])
+        names = ", ".join(sorted([p.name for p in players])) or "—"
+        emb = discord.Embed(title=f"{key.upper()} status", color=discord.Color.green())
+        emb.add_field(name="Address", value=f"{s['host']}:{s['port']}", inline=True)
+        emb.add_field(name="Map", value=getattr(info, "map_name", "?"), inline=True)
+        emb.add_field(name="Players", value=f"{info.player_count}/{info.max_players}", inline=True)
+        emb.add_field(name="Player names", value=names[:1024], inline=False)
+        await interaction.followup.send(embed=emb, ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"Failed to query: `{e}`", ephemeral=True)
 
-class WhitelistModal(discord.ui.Modal, title="Whitelist Request"):
-    ign = discord.ui.TextInput(label="Minecraft username", max_length=32)
-    note = discord.ui.TextInput(label="Notes (optional)", style=discord.TextStyle.paragraph, required=False)
+# ---------- UI
+
+class ChangeMapModal(discord.ui.Modal, title="Change Map"):
+    map_name = discord.ui.TextInput(label="Map (e.g., de_mirage)", required=True, max_length=64)
+
+    def __init__(self, server_key: str):
+        super().__init__()
+        self.server_key = server_key
 
     async def on_submit(self, interaction: discord.Interaction):
-        await _ack(interaction)
-        if not _has_any_role(interaction.user, WHITELIST_ALLOWED_ROLE_IDS):
-            return await interaction.followup.send("You don’t have permission to request whitelist.", ephemeral=True)
-        player = str(self.ign).strip()
+        s = _srv(self.server_key)
         try:
-            await asyncio.wait_for(mc_cmd(f"whitelist add {player}"), timeout=8)
-            await asyncio.wait_for(mc_cmd("whitelist reload"), timeout=8)
-            await interaction.followup.send(f"✅ Added **{player}** to whitelist.", ephemeral=True)
-        except asyncio.TimeoutError:
-            await interaction.followup.send("❌ RCON timed out (check reachability).", ephemeral=True)
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            out = await rcon_exec(s["rcon_host"], s["rcon_port"], s["rcon_pass"], f"changelevel {self.map_name.value}")
+            await interaction.followup.send(f"{self.server_key.upper()} → changelevel `{self.map_name.value}` → `{out.strip() or 'ok'}`", ephemeral=True)
         except Exception as e:
-            await interaction.followup.send(f"❌ RCON error: `{e}`", ephemeral=True)
+            await interaction.followup.send(f"RCON failed: `{e}`", ephemeral=True)
 
-class SupportModal(discord.ui.Modal, title="Contact Admin"):
-    subject = discord.ui.TextInput(label="Subject", max_length=80)
-    details = discord.ui.TextInput(label="What do you need?", style=discord.TextStyle.paragraph, max_length=1000)
+class SayModal(discord.ui.Modal, title="Say (server chat)"):
+    text = discord.ui.TextInput(label="Message", required=True, max_length=190)
+
+    def __init__(self, server_key: str):
+        super().__init__()
+        self.server_key = server_key
 
     async def on_submit(self, interaction: discord.Interaction):
-        await _ack(interaction)
-        ch = interaction.channel
-        if not isinstance(ch, discord.TextChannel):
-            return await interaction.followup.send("Run in a text channel.", ephemeral=True)
+        s = _srv(self.server_key)
         try:
-            thread = await ch.create_thread(
-                name=f"support-{interaction.user.name}-{interaction.user.id}",
-                type=discord.ChannelType.private_thread,
-            )
-            await thread.add_user(interaction.user)
-            emb = discord.Embed(title="New Support Request", color=0x2b88d8)
-            emb.add_field(name="User", value=interaction.user.mention, inline=True)
-            emb.add_field(name="Subject", value=str(self.subject), inline=True)
-            emb.add_field(name="Details", value=str(self.details), inline=False)
-            await thread.send(_admin_mentions(), embed=emb)
-            await interaction.followup.send(f"Created {thread.mention}", ephemeral=True)
-        except discord.Forbidden:
-            await interaction.followup.send("I need **Manage Threads** permission here.", ephemeral=True)
-
-# ------------------------------- View --------------------------------
-
-class PortalView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label="Whitelist", style=discord.ButtonStyle.primary, custom_id="portal:whitelist")
-    async def whitelist_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
-        if not _has_any_role(interaction.user, WHITELIST_ALLOWED_ROLE_IDS):
-            return await interaction.response.send_message("You don’t have permission to request whitelist.", ephemeral=True)
-        await interaction.response.send_modal(WhitelistModal())
-
-    @discord.ui.button(label="Server Info", style=discord.ButtonStyle.secondary, custom_id="portal:status")
-    async def status_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
-        await _ack(interaction)
-        try:
-            info = await asyncio.wait_for(get_status(), timeout=8)
-            await interaction.followup.send(embed=_portal_embed(server_info=info), ephemeral=True)
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            out = await rcon_exec(s["rcon_host"], s["rcon_port"], s["rcon_pass"], f'say {self.text.value}')
+            await interaction.followup.send(f"{self.server_key.upper()} → say → `{out.strip() or 'ok'}`", ephemeral=True)
         except Exception as e:
-            await interaction.followup.send(f"Status error: `{e}`", ephemeral=True)
+            await interaction.followup.send(f"RCON failed: `{e}`", ephemeral=True)
 
-    @discord.ui.button(label="Server Properties", style=discord.ButtonStyle.secondary, custom_id="portal:props")
-    async def props_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
-        await _ack(interaction)
+class RconModal(discord.ui.Modal, title="Custom RCON (mods only)"):
+    command = discord.ui.TextInput(label="Command", required=True, max_length=190)
+
+    def __init__(self, server_key: str):
+        super().__init__()
+        self.server_key = server_key
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not _is_mod(interaction.user):
+            return await interaction.response.send_message("No permission.", ephemeral=True)
+        s = _srv(self.server_key)
         try:
-            text = await asyncio.wait_for(read_server_properties_text(), timeout=10)
-            d: dict[str, str] = {}
-            for line in text.splitlines():
-                if line.strip() and not line.strip().startswith("#") and "=" in line:
-                    k, v = line.split("=", 1)
-                    d[k.strip()] = v.strip()
-            keys = ("motd", "difficulty", "max-players", "online-mode", "server-port", "pvp", "view-distance")
-            subset = {k: d[k] for k in keys if k in d}
-            snippet = "\n".join(f"{k}={v}" for k, v in list(d.items())[:12])
-            emb = _portal_embed(props_small=subset)
-            if snippet:
-                emb.add_field(name="Snippet", value=f"```properties\n{snippet}\n```", inline=False)
-            await interaction.followup.send(embed=emb, ephemeral=True)
-        except asyncio.TimeoutError:
-            await interaction.followup.send("SFTP error: timed out.", ephemeral=True)
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            out = await rcon_exec(s["rcon_host"], s["rcon_port"], s["rcon_pass"], self.command.value)
+            await interaction.followup.send(f"{self.server_key.upper()} → `{self.command.value}` → `{out.strip() or 'ok'}`", ephemeral=True)
         except Exception as e:
-            await interaction.followup.send(f"SFTP error: `{e}`", ephemeral=True)
+            await interaction.followup.send(f"RCON failed: `{e}`", ephemeral=True)
 
-    @discord.ui.button(label="Ask Admin", style=discord.ButtonStyle.success, custom_id="portal:support")
-    async def support_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
-        await interaction.response.send_modal(SupportModal())
+class PortaView(discord.ui.View):
+    def __init__(self, timeout=None):
+        super().__init__(timeout=timeout)
 
-    @discord.ui.button(label="Copy Connect", style=discord.ButtonStyle.secondary, custom_id="portal:copyconnect")
-    async def copy_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
-        await _ack(interaction)
-        txt = f"{SRV_DNS}:{SRV_PORT}\n{SRV_IP}:{SRV_PORT}"
-        await interaction.followup.send(
-            f"Copy one of these and paste into Minecraft:\n```text\n{txt}\n```",
-            ephemeral=True
+    # SURF row
+    @discord.ui.button(label="Surf: Info", style=discord.ButtonStyle.secondary, row=0)
+    async def surf_info(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _ephemeral_info(interaction, "surf")
+
+    @discord.ui.button(label="Surf: Password", style=discord.ButtonStyle.secondary, row=0)
+    async def surf_pw(self, interaction: discord.Interaction, button: discord.ui.Button):
+        s = _srv("surf")
+        await interaction.response.send_message(f"**SURF password:** ||{s['server_pass'] or '— (no password)'}||", ephemeral=True)
+
+    @discord.ui.button(label="Surf: Change Map", style=discord.ButtonStyle.primary, row=0)
+    async def surf_chmap(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(ChangeMapModal("surf"))
+
+    @discord.ui.button(label="Surf: Restart", style=discord.ButtonStyle.danger, row=0)
+    async def surf_restart(self, interaction: discord.Interaction, button: discord.ui.Button):
+        s = _srv("surf")
+        try:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            out = await rcon_exec(s["rcon_host"], s["rcon_port"], s["rcon_pass"], "mp_restartgame 1")
+            await interaction.followup.send(f"SURF restart → `{out.strip() or 'ok'}`", ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"RCON failed: `{e}`", ephemeral=True)
+
+    @discord.ui.button(label="Surf: Say", style=discord.ButtonStyle.success, row=0)
+    async def surf_say(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(SayModal("surf"))
+
+    # BHOP row
+    @discord.ui.button(label="Bhop: Info", style=discord.ButtonStyle.secondary, row=1)
+    async def bhop_info(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _ephemeral_info(interaction, "bhop")
+
+    @discord.ui.button(label="Bhop: Password", style=discord.ButtonStyle.secondary, row=1)
+    async def bhop_pw(self, interaction: discord.Interaction, button: discord.ui.Button):
+        s = _srv("bhop")
+        await interaction.response.send_message(f"**BHOP password:** ||{s['server_pass'] or '— (no password)'}||", ephemeral=True)
+
+    @discord.ui.button(label="Bhop: Change Map", style=discord.ButtonStyle.primary, row=1)
+    async def bhop_chmap(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(ChangeMapModal("bhop"))
+
+    @discord.ui.button(label="Bhop: Restart", style=discord.ButtonStyle.danger, row=1)
+    async def bhop_restart(self, interaction: discord.Interaction, button: discord.ui.Button):
+        s = _srv("bhop")
+        try:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            out = await rcon_exec(s["rcon_host"], s["rcon_port"], s["rcon_pass"], "mp_restartgame 1")
+            await interaction.followup.send(f"BHOP restart → `{out.strip() or 'ok'}`", ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"RCON failed: `{e}`", ephemeral=True)
+
+    @discord.ui.button(label="Bhop: Say", style=discord.ButtonStyle.success, row=1)
+    async def bhop_say(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(SayModal("bhop"))
+
+    # Tools row
+    @discord.ui.button(label="Connect Links", style=discord.ButtonStyle.secondary, row=2)
+    async def connect_links(self, interaction: discord.Interaction, button: discord.ui.Button):
+        s1 = _srv("surf"); s2 = _srv("bhop")
+        msg = (
+            f"**Surf**: `steam://connect/{s1['host']}:{s1['port']}`\n"
+            f"**Bhop**: `steam://connect/{s2['host']}:{s2['port']}`"
         )
+        await interaction.response.send_message(msg, ephemeral=True)
 
-    @discord.ui.button(label="Plugins", style=discord.ButtonStyle.secondary, custom_id="portal:plugins")
-    async def plugins_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
-        await _ack(interaction)
-        try:
-            names = await asyncio.wait_for(list_plugins(), timeout=12)
-            folders = [n[:-1] for n in names if n.endswith("/")]
-            if not folders:
-                return await interaction.followup.send("No plugin folders found in `MC_PLUGINS_DIR`.", ephemeral=True)
-            shown = folders[:50]
-            more = len(folders) - len(shown)
-            block = "\n".join(shown)
-            desc = f"Found **{len(folders)}** plugin folder(s):\n```text\n{block}\n```"
-            if more > 0:
-                desc += f"\n… and **{more} more**"
-            e = discord.Embed(title="📦 Plugins (folders)", description=desc, color=0x2b88d8)
-            e.set_footer(text="From MC_PLUGINS_DIR via SFTP")
-            await interaction.followup.send(embed=e, ephemeral=True)
-        except asyncio.TimeoutError:
-            await interaction.followup.send("SFTP error: timed out while listing plugins.", ephemeral=True)
-        except Exception as e:
-            await interaction.followup.send(f"SFTP error while listing plugins: `{e}`", ephemeral=True)
+    @discord.ui.button(label="RCON (mods)", style=discord.ButtonStyle.secondary, row=2)
+    async def custom_rcon(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not _is_mod(interaction.user):
+            return await interaction.response.send_message("No permission.", ephemeral=True)
+        # Ask which server using a select modal pattern: two separate modals for simplicity
+        # default to SURF; user can run again for BHOP
+        await interaction.response.send_modal(RconModal("surf"))
 
-# ------------------------------- Cog ---------------------------------
+# ---------- Cog
 
-class PortalCog(commands.Cog):
+class PortaCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self._portal_message_id: int | None = None
-        self._props_small_cache: dict[str, str] | None = None
-        self._auto_task: asyncio.Task | None = None
-        self._last_voice_name: str | None = None
+        self.refresh_task.start()
 
-    @commands.Cog.listener()
-    async def on_ready(self):
-        self.bot.add_view(PortalView())
-        await self._ensure_properties_cache()
-        await self._post_or_update_portal()
-        if not self._auto_task or self._auto_task.done():
-            self._auto_task = asyncio.create_task(self._auto_refresh_loop())
+    def cog_unload(self):
+        self.refresh_task.cancel()
 
-    async def _ensure_properties_cache(self):
-        with contextlib.suppress(Exception):
-            text = await asyncio.wait_for(read_server_properties_text(), timeout=10)
-            d: dict[str, str] = {}
-            for line in text.splitlines():
-                if line.strip() and not line.strip().startswith("#") and "=" in line:
-                    k, v = line.split("=", 1)
-                    d[k.strip()] = v.strip()
-            keys = ("motd", "difficulty", "max-players", "online-mode", "server-port", "pvp", "view-distance")
-            self._props_small_cache = {k: d[k] for k in keys if k in d}
-
-    async def _get_or_find_portal_message(self, ch: discord.TextChannel) -> discord.Message | None:
-        if self._portal_message_id:
-            with contextlib.suppress(Exception):
-                return await ch.fetch_message(self._portal_message_id)
-        existing = None
-        async for m in ch.history(limit=50):
-            if m.author == self.bot.user and m.embeds and (m.embeds[0].footer and m.embeds[0].footer.text == "GameOperator Portal"):
-                existing = m
-                break
-        if existing:
-            self._portal_message_id = existing.id
-        return existing
-
-    async def _post_or_update_portal(self, live_info: Optional[dict] = None):
-        ch = self.bot.get_channel(PORTAL_CHANNEL_ID)
+    @app_commands.command(name="cs2panel_porta", description="Post or update the CS2 porta panel in this channel (mods only)")
+    async def cs2panel_porta(self, interaction: discord.Interaction):
+        if not _is_mod(interaction.user):
+            return await interaction.response.send_message("No permission.", ephemeral=True)
+        ch = interaction.channel
         if not isinstance(ch, discord.TextChannel):
-            log.error("[portal] Channel %s not found or wrong type.", PORTAL_CHANNEL_ID)
-            return
+            return await interaction.response.send_message("Run this in a text channel.", ephemeral=True)
 
-        info = live_info
-        if info is None:
-            with contextlib.suppress(Exception):
-                info = await asyncio.wait_for(get_status(), timeout=8)
+        # find existing
+        async with SessionLocal() as ses:
+            row = await ses.scalar(
+                discord.utils.asyncio.to_thread(lambda: None)
+            )  # placeholder to keep structure; real query next lines
 
-        embed = _portal_embed(server_info=info, props_small=self._props_small_cache)
+        # Real query (SQLAlchemy 2.0 async):
+        async with SessionLocal() as ses:
+            row = await ses.execute(
+                # simple manual select because we didn't import select earlier
+                # but for clarity let's import here
+                # from sqlalchemy import select  -> top of file if you prefer
+                __import__("sqlalchemy").sql.select(CS2PanelMessage).where(CS2PanelMessage.channel_id == ch.id)
+            )
+            row = row.scalar_one_or_none()
 
-        msg = await self._get_or_find_portal_message(ch)
-        try:
-            if msg:
-                await msg.edit(embed=embed, view=PortalView())
-                log.debug("[portal] Updated portal message: %s", msg.id)
-            else:
-                sent = await ch.send(embed=embed, view=PortalView())
-                self._portal_message_id = sent.id
-                log.info("[portal] Posted portal message: %s", sent.id)
-        except Exception:
-            log.exception("[portal] Failed to post/update portal message.")
+        embed = await build_status_embed()
+        view = PortaView()
 
-    async def _auto_refresh_loop(self):
-        await self.bot.wait_until_ready()
-        while not self.bot.is_closed():
+        if row:
+            # edit existing message
             try:
-                info = None
-                with contextlib.suppress(Exception):
-                    info = await asyncio.wait_for(get_status(), timeout=8)
+                msg = await ch.fetch_message(row.message_id)
+                await msg.edit(embed=embed, view=view)
+                return await interaction.response.send_message("Panel updated.", ephemeral=True)
+            except Exception:
+                # message missing — recreate
+                pass
 
-                # Update portal embed with fresh player list
-                await self._post_or_update_portal(live_info=info)
+        # create new
+        sent = await ch.send(embed=embed, view=view)
+        async with SessionLocal() as ses:
+            await ses.merge(CS2PanelMessage(channel_id=ch.id, message_id=sent.id))
+            await ses.commit()
+        await interaction.response.send_message("Panel posted.", ephemeral=True)
 
-                # Optionally rename a voice channel with online count
-                if MC_STATUS_VOICE_CHANNEL_ID and info:
-                    ch = self.bot.get_channel(MC_STATUS_VOICE_CHANNEL_ID)
-                    if isinstance(ch, discord.VoiceChannel):
-                        new_name = f"MC Online: {info.get('online','?')}/{info.get('max','?')}"
-                        if new_name != self._last_voice_name:
-                            with contextlib.suppress(discord.Forbidden, discord.HTTPException):
-                                await ch.edit(name=new_name, reason="Auto status update")
-                                self._last_voice_name = new_name
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                log.debug("[portal] auto refresh error: %s", e)
-            await asyncio.sleep(max(15, PORTAL_REFRESH_SECONDS))
+    @tasks.loop(seconds=30)
+    async def refresh_task(self):
+        # iterate over all panels and refresh embeds
+        async with SessionLocal() as ses:
+            from sqlalchemy import select
+            rows = (await ses.execute(select(CS2PanelMessage))).scalars().all()
 
-    @app_commands.command(name="portal", description="Repost the portal here")
-    async def portal(self, interaction: discord.Interaction):
-        await _ack(interaction)
-        await self._ensure_properties_cache()
-        await self._post_or_update_portal()
-        await interaction.followup.send("Portal posted/updated.", ephemeral=True)
+        for row in rows:
+            try:
+                ch = self.bot.get_channel(row.channel_id)
+                if not isinstance(ch, discord.TextChannel):
+                    continue
+                msg = await ch.fetch_message(row.message_id)
+                embed = await build_status_embed()
+                await msg.edit(embed=embed, view=PortaView())
+                await asyncio.sleep(0.2)  # be polite to rate limits
+            except Exception:
+                # if message/channel vanished, cleanup
+                async with SessionLocal() as ses:
+                    from sqlalchemy import delete
+                    await ses.execute(delete(CS2PanelMessage).where(CS2PanelMessage.id == row.id))
+                    await ses.commit()
 
-async def setup(bot: commands.Bot):
-    await bot.add_cog(PortalCog(bot))
+    @refresh_task.before_loop
+    async def before_refresh(self):
+        await self.bot.wait_until_ready()

@@ -1,3 +1,12 @@
-# py_Discord_VSB_GameOperator
-.
-..
+# CS2 Discord Bot (Surf + Bhop)
+
+## Quick start
+```bash
+cp .env.example .env
+# fill tokens, IPs/ports/passwords
+
+docker compose up -d --build
+# or locally:
+# python3 -m venv .venv && source .venv/bin/activate
+# pip install -r requirements.txt
+# python server.py

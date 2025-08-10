@@ -1,55 +1,56 @@
-from pydantic_settings import BaseSettings, SettingsConfigDict
+import os
+from dataclasses import dataclass
+from typing import Sequence
 
-class Settings(BaseSettings):
+def _csv_ints(s: str | None) -> list[int]:
+    if not s:
+        return []
+    return [int(x.strip()) for x in s.split(",") if x.strip().isdigit()]
+
+@dataclass
+class Settings:
     # Discord
-    DISCORD_TOKEN: str
-    DISCORD_GUILD_ID: int
-    DISCORD_ADMIN_ROLE_IDS: str = ""
-    DISCORD_MOD_ROLE_IDS: str = ""
-    DISCORD_SERVER_MOD_ROLE_IDS: str = ""
-    DISCORD_ALERT_CHANNEL_ID: int
-    DISCORD_VOICE_CHANNEL_ID: int
-    DISCORD_COMMAND_PREFIX: str = "!"
-    DISCORD_MC_CHAT_CHANNEL_ID: int = 0  # channel to forward MC chat into
-
-    # RCON
-    # Optional RCON keepalive
-    RCON_KEEPALIVE_SECONDS: int = 30
-    MC_RCON_HOST: str = "s450618-zn4kp.spot.gs"
-    MC_RCON_PORT: int = 31096
-    MC_RCON_PASSWORD: str
-    MC_SERVER_NAME: str = "VŠB Minecraft"
-    MC_LOG_PATH: str = "/path/to/server/logs/latest.log"
-
-    # SFTP
-    SFTP_HOST: str
-    SFTP_PORT: int = 22
-    SFTP_USERNAME: str
-    SFTP_PASSWORD: str
-    MC_SERVER_DIR: str
-    MC_PROPERTIES_PATH: str
-    MC_PLUGINS_DIR: str
-    
+    DISCORD_BOT_TOKEN: str = os.getenv("DISCORD_BOT_TOKEN", "")
+    DISCORD_GUILD_ID: int = int(os.getenv("DISCORD_GUILD_ID", "0"))
+    PANEL_CHANNEL_ID: int = int(os.getenv("DISCORD_PANEL_CHANNEL_ID", "0"))
+    DISCORD_ADMIN_ROLE_IDS: str = os.getenv("DISCORD_ADMIN_ROLE_IDS", "")
+    DISCORD_MOD_ROLE_IDS: str = os.getenv("DISCORD_MOD_ROLE_IDS", "")
 
     # DB
-    DB_HOST: str = "db"
-    DB_PORT: int = 5432
-    DB_USER: str = "vsb"
-    DB_PASSWORD: str = "vsb_password"
-    DB_NAME: str = "vsb_bot"
+    DB_HOST: str = os.getenv("DB_HOST", "localhost")
+    DB_PORT: int = int(os.getenv("DB_PORT", "5432"))
+    DB_USER: str = os.getenv("DB_USER", "vsb")
+    DB_PASSWORD: str = os.getenv("DB_PASSWORD", "vsbpass")
+    DB_NAME: str = os.getenv("DB_NAME", "vsb_bot")
 
-    # App
-    APP_ENV: str = "dev"
-    LOG_LEVEL: str = "INFO"
-    POLL_INTERVAL_SECONDS: int = 15
+    # HTTP
+    HTTP_HOST: str = os.getenv("HTTP_HOST", "0.0.0.0")
+    HTTP_PORT: int = int(os.getenv("HTTP_PORT", "8080"))
+    LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+    # CS2
+    CS2: dict = None  # filled below
 
-    @property
-    def database_url(self) -> str:
-        return f"postgresql+asyncpg://{self.DB_USER}:{self.DB_PASSWORD}@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
-
-    def roles_from_csv(self, csv: str) -> list[int]:
-        return [int(x) for x in csv.split(",") if x.strip()]
+    def roles_from_csv(self, s: str) -> Sequence[int]:
+        return _csv_ints(s)
 
 settings = Settings()
+
+settings.CS2 = {
+    "surf": {
+        "host": os.getenv("CS2_SURF_HOST", "127.0.0.1"),
+        "port": int(os.getenv("CS2_SURF_PORT", "27015")),
+        "rcon_host": os.getenv("CS2_SURF_RCON_HOST", "127.0.0.1"),
+        "rcon_port": int(os.getenv("CS2_SURF_RCON_PORT", "27015")),
+        "rcon_pass": os.getenv("CS2_SURF_RCON_PASSWORD", ""),
+        "server_pass": os.getenv("CS2_SURF_PASSWORD", ""),
+    },
+    "bhop": {
+        "host": os.getenv("CS2_BHOP_HOST", "127.0.0.1"),
+        "port": int(os.getenv("CS2_BHOP_PORT", "27016")),
+        "rcon_host": os.getenv("CS2_BHOP_RCON_HOST", "127.0.0.1"),
+        "rcon_port": int(os.getenv("CS2_BHOP_RCON_PORT", "27016")),
+        "rcon_pass": os.getenv("CS2_BHOP_RCON_PASSWORD", ""),
+        "server_pass": os.getenv("CS2_BHOP_PASSWORD", ""),
+    },
+}

@@ -1,39 +1,33 @@
-# services/presence_task.py
 import asyncio
+from discord.ext import tasks
 import discord
 from utils.config import settings
-from utils.rcon_client import get_status
+from utils.source_query import get_info
 
-def setup_presence_tasks(bot):
-    async def updater():
-        await bot.wait_until_ready()
-        vc_id = settings.DISCORD_VOICE_CHANNEL_ID
-        server_name = settings.MC_SERVER_NAME  # <— new
+async def _compose_presence():
+    s = settings.CS2
+    parts = []
+    for key in ("surf", "bhop"):
+        try:
+            info = await get_info(s[key]["host"], s[key]["port"])
+            parts.append(f"{key.capitalize()} {info.player_count}/{info.max_players}")
+        except Exception:
+            parts.append(f"{key.capitalize()} offline")
+    return " | ".join(parts)
 
-        while not bot.is_closed():
-            try:
-                status = await get_status()  # {"online": int, "max": int, ...}
-                # Desired format: "<server name> X/X"
-                target_name = f"{server_name} {status['online']}/{status['max']}"
+class PresenceTasks:
+    def __init__(self, bot: discord.Client):
+        self.bot = bot
+        self.loop.start()
 
-                vc = bot.get_channel(vc_id)
-                if isinstance(vc, discord.VoiceChannel):
-                    # Discord channel names have a 100-char limit; be safe:
-                    safe_name = target_name[:100]
-                    if vc.name != safe_name:
-                        await vc.edit(name=safe_name)
+    @tasks.loop(seconds=60)
+    async def loop(self):
+        try:
+            txt = await _compose_presence()
+            await self.bot.change_presence(activity=discord.Game(name=txt))
+        except Exception:
+            pass
 
-                # Optional: also set bot presence to show just X players
-                act = discord.Activity(
-                    type=discord.ActivityType.watching,
-                    name=f"{status['online']} players"
-                )
-                await bot.change_presence(activity=act)
-
-            except Exception:
-                # swallow errors; next tick will retry
-                pass
-
-            await asyncio.sleep(settings.POLL_INTERVAL_SECONDS)
-
-    bot.loop.create_task(updater())
+    @loop.before_loop
+    async def before_loop(self):
+        await self.bot.wait_until_ready()
