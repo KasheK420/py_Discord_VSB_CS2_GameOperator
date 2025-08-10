@@ -2,6 +2,8 @@ import asyncio
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
+from sqlalchemy import select, delete
+
 from utils.config import settings
 from utils.source_query import get_info, get_players
 from utils.rcon_cs2 import rcon_exec
@@ -193,8 +195,6 @@ class PortaView(discord.ui.View):
     async def custom_rcon(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not _is_mod(interaction.user):
             return await interaction.response.send_message("No permission.", ephemeral=True)
-        # Ask which server using a select modal pattern: two separate modals for simplicity
-        # default to SURF; user can run again for BHOP
         await interaction.response.send_modal(RconModal("surf"))
 
 # ---------- Cog
@@ -207,29 +207,23 @@ class PortaCog(commands.Cog):
     def cog_unload(self):
         self.refresh_task.cancel()
 
-    @app_commands.command(name="cs2panel_porta", description="Post or update the CS2 porta panel in this channel (mods only)")
+    @app_commands.command(
+        name="cs2panel_porta",
+        description="Post or update the CS2 porta panel in this channel (mods only)"
+    )
     async def cs2panel_porta(self, interaction: discord.Interaction):
         if not _is_mod(interaction.user):
             return await interaction.response.send_message("No permission.", ephemeral=True)
+
         ch = interaction.channel
         if not isinstance(ch, discord.TextChannel):
             return await interaction.response.send_message("Run this in a text channel.", ephemeral=True)
 
-        # find existing
+        # check existing panel record for this channel
         async with SessionLocal() as ses:
-            row = await ses.scalar(
-                discord.utils.asyncio.to_thread(lambda: None)
-            )  # placeholder to keep structure; real query next lines
-
-        # Real query (SQLAlchemy 2.0 async):
-        async with SessionLocal() as ses:
-            row = await ses.execute(
-                # simple manual select because we didn't import select earlier
-                # but for clarity let's import here
-                # from sqlalchemy import select  -> top of file if you prefer
-                __import__("sqlalchemy").sql.select(CS2PanelMessage).where(CS2PanelMessage.channel_id == ch.id)
-            )
-            row = row.scalar_one_or_none()
+            row = (await ses.execute(
+                select(CS2PanelMessage).where(CS2PanelMessage.channel_id == ch.id)
+            )).scalar_one_or_none()
 
         embed = await build_status_embed()
         view = PortaView()
@@ -255,7 +249,6 @@ class PortaCog(commands.Cog):
     async def refresh_task(self):
         # iterate over all panels and refresh embeds
         async with SessionLocal() as ses:
-            from sqlalchemy import select
             rows = (await ses.execute(select(CS2PanelMessage))).scalars().all()
 
         for row in rows:
@@ -270,7 +263,6 @@ class PortaCog(commands.Cog):
             except Exception:
                 # if message/channel vanished, cleanup
                 async with SessionLocal() as ses:
-                    from sqlalchemy import delete
                     await ses.execute(delete(CS2PanelMessage).where(CS2PanelMessage.id == row.id))
                     await ses.commit()
 
